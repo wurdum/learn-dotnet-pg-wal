@@ -121,3 +121,5 @@ modules.xml
 .vscode
 .idea
 *.user
+.aider*
+.env
