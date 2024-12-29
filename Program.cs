@@ -1,12 +1,18 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
+using Npgsql.Replication;
+using Npgsql.Replication.PgOutput;
+using Npgsql.Replication.PgOutput.Messages;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddDbContext<ApplicationContext>(options => options
-    .UseNpgsql("Host=localhost;Port=5432;Database=postgres;Username=postgres;Password=postgres")
+builder.Services.AddDbContext<ApplicationContext>((sp, options) => options
+    .UseNpgsql(sp.GetRequiredService<IConfiguration>().GetConnectionString("Postgres"))
     .UseSnakeCaseNamingConvention());
 
 builder.Services.AddHostedService<Biography>();
+builder.Services.AddHostedService<WalListener>();
 
 var app = builder.Build();
 
@@ -62,5 +68,106 @@ public class Biography(IServiceProvider serviceProvider) : BackgroundService
 
             await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
         }
+    }
+}
+
+public class WalListener(IConfiguration configuration, ILogger<WalListener> logger) : BackgroundService
+{
+    private const string ReplicationSlotName = "wal_listener";
+    private const string PublicationName = "life_events";
+    private const string TableName = "life_events";
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+
+        var connectionString = configuration.GetConnectionString("Postgres")!;
+
+        await EnsurePublication(connectionString, stoppingToken);
+        await EnsureReplicationSlot(connectionString, stoppingToken);
+
+        await using var connection = new LogicalReplicationConnection(connectionString);
+        await connection.Open(stoppingToken);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await foreach (var message in connection.StartReplication(
+                   new PgOutputReplicationSlot(ReplicationSlotName),
+                   new PgOutputReplicationOptions(PublicationName, PgOutputProtocolVersion.V3),
+                   stoppingToken))
+                {
+                    if (message is InsertMessage insert)
+                    {
+                        var record = new Dictionary<string, object?>();
+
+                        var columnIndex = 0;
+                        await foreach (var replicationValue in insert.NewRow)
+                        {
+                            var columnName = insert.Relation.Columns[columnIndex++].ColumnName;
+                            var value = await replicationValue.Get(stoppingToken);
+                            record[columnName] = replicationValue.IsDBNull ? null : value;
+                        }
+
+                        logger.LogInformation(JsonSerializer.Serialize(record));
+                    }
+
+                    connection.SetReplicationStatus(message.WalEnd);
+                }
+            }
+            catch (PostgresException exception) when (exception.SqlState == "55006") // Replication slot is active.
+            {
+                logger.LogWarning("Replication slot is active");
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
+        }
+    }
+
+    private async Task EnsureReplicationSlot(string connectionString, CancellationToken cancellationToken)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        var sql = $"""
+            do $$
+            begin
+                if not exists (
+                    select 1
+                    from pg_replication_slots
+                    where slot_name = '{ReplicationSlotName}'
+                ) then
+                    perform pg_create_logical_replication_slot('{ReplicationSlotName}', 'pgoutput');
+                end if;
+            end
+            $$;
+            """;
+
+        await using var cmd = new NpgsqlCommand(sql, connection);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private async Task EnsurePublication(string connectionString, CancellationToken cancellationToken)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        var sql = $"""
+            do $$
+            begin
+                if not exists (
+                    select 1
+                    from pg_publication
+                    where pubname = '{PublicationName}'
+                ) then
+                    create publication {PublicationName}
+                        for table public.{TableName};
+                end if;
+            end
+            $$;
+            """;
+
+        await using var cmd = new NpgsqlCommand(sql, connection);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 }
